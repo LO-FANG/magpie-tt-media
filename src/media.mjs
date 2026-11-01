@@ -307,6 +307,24 @@ function json(res,status,body) {
   res.writeHead(status,{'Content-Type':'application/json; charset=utf-8','Cache-Control':'no-store'});
   res.end(JSON.stringify(body));
 }
+// TokenDance reads the Kilo subscription. These fields only: stripe ids, subscription ids and the key stay out.
+const kiloFields = ['tier','cadence','status','cancelAtPeriodEnd','startedAt','nextBillingAt','refillAt','currentPeriodBaseCreditsUsd','currentPeriodUsageUsd','currentPeriodBonusCreditsUsd','isBonusUnlocked','nextBonusCreditsUsd','currentStreakMonths'];
+async function kiloPass() {
+  const {providers} = JSON.parse(await readFile(join(homedir(),'.config','magpie','providers.json'),'utf8'));
+  const key = providers.find(provider => provider.id === 'kilo')?.key;
+  if (!key) throw Object.assign(new Error('kilo provider is not configured'), {status:404});
+  const headers = {Authorization:`Bearer ${key}`};
+  const [state, balance] = await Promise.all([
+    fetch('https://api.kilo.ai/api/trpc/kiloPass.getState', {headers}),
+    fetch('https://api.kilo.ai/api/profile/balance', {headers}),
+  ]);
+  if (!state.ok || !balance.ok) throw Object.assign(new Error(`Kilo request failed (${state.status}, ${balance.status})`), {status:502});
+  const subscription = (await state.json()).result.data.subscription ?? {};
+  const body = {};
+  for (const name of kiloFields) body[name] = subscription[name];
+  body.balance = (await balance.json()).balance;
+  return body;
+}
 export async function handle(store,req,res) {
   // Magpie frames use an opaque sandbox origin, including after navigation
   // to the local service. Fetch therefore needs an explicit CORS response.
@@ -319,6 +337,7 @@ export async function handle(store,req,res) {
     const url = new URL(req.url,'http://localhost');
     if (!['GET','HEAD'].includes(req.method)) { res.setHeader('Allow','GET, HEAD'); return json(res,405,{error:'Read-only service'}); }
     if (url.pathname === '/health') return json(res,200,{name:'magpie-tt-media',version:'0.9.0',agents:['codex','claude'],capabilities:['media','activity','transcript']});
+    if (url.pathname === '/kilo') return json(res,200,await kiloPass());
     if (url.pathname === '/activity') {
       const result = await store.activity.snapshot(url.searchParams.get('id') ?? '', Number(url.searchParams.get('after') ?? 0), url.searchParams.get('epoch') ?? '', url.searchParams.get('agent') ?? 'codex');
       return json(res,200,result);

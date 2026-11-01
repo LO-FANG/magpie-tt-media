@@ -99,3 +99,12 @@ magpie plugin add "$HOME/Desktop/magpie-tt-media"
 ## 0.9.0：part 稳定标识
 
 `/transcript` 的每个 part 带 `seq`：该内容在会话文件里的行号乘 1000，加它在这一行内的序号。窗口起点随会话增长向后移动时，同一内容的 `seq` 不变，调用方据此识别内容。
+
+## Kilo 订阅
+
+`GET /kilo` 给 TokenDance 读取 Kilo 订阅。从 `~/.config/magpie/providers.json`（`{providers, groups}`）取出 id 为 `kilo` 的 provider 的 API key，以 `Authorization: Bearer` 请求：
+
+- `GET https://api.kilo.ai/api/trpc/kiloPass.getState`，订阅在 `result.data.subscription`。
+- `GET https://api.kilo.ai/api/profile/balance`，返回 `{"balance": number}`。
+
+成功时返回 `tier`、`cadence`、`status`、`cancelAtPeriodEnd`、`startedAt`、`nextBillingAt`、`refillAt`、`currentPeriodBaseCreditsUsd`、`currentPeriodUsageUsd`、`currentPeriodBonusCreditsUsd`、`isBonusUnlocked`、`nextBonusCreditsUsd`、`currentStreakMonths`，以及 `balance`。不返回 stripe id、subscription id，或其他任何 id 与 key。没有配置 kilo，或上游请求失败时，返回带 `error` 字段的 JSON。

@@ -84,12 +84,14 @@ function action(payload) {
 export class ActivityStore {
   constructor(media) { this.media = media; this.sessions = new Map(); }
   async snapshot(id, after = 0, epoch = '', agent = 'codex') {
-    const claude = agent === 'claude' || agent === 'claude-desktop';
-    const key = `${claude ? 'claude' : 'codex'}:${id}`;
-    const file = this.sessions.get(key)?.file ?? await (claude ? this.media.findClaude(id) : this.media.find(id)), info = await stat(file);
-    if (file.endsWith('.zst')) throw Object.assign(new Error('Live activity requires an uncompressed Codex rollout'), {status:422});
+    const family = agent === 'claude' || agent === 'claude-desktop' ? 'claude'
+      : ['pi', 'pi-agent', 'pi-coding-agent', 'pi-cli'].includes(agent) ? 'pi' : 'codex';
+    const key = `${family}:${id}`;
+    const file = this.sessions.get(key)?.file ?? await (family === 'claude' ? this.media.findClaude(id) : family === 'pi' ? this.media.findPi(id) : this.media.find(id)), info = await stat(file);
+    if (family === 'codex' && file.endsWith('.zst')) throw Object.assign(new Error('Live activity requires an uncompressed Codex rollout'), {status:422});
     let state = this.sessions.get(key);
-    const cacheDirectory = join(claude ? this.media.claudeHome : this.media.home, 'tt-activity');
+    const cacheRoot = family === 'claude' ? this.media.claudeHome : family === 'pi' ? this.media.piHome : this.media.home;
+    const cacheDirectory = join(cacheRoot, 'tt-activity');
     const cacheFile = join(cacheDirectory, `${id}.json`);
     if (!state) {
       try {
@@ -127,7 +129,9 @@ export class ActivityStore {
             const line=pending.subarray(begin,end).toString('utf8');begin=end+1;
             if (!line.trim()) continue;
             let record;try {record=JSON.parse(line);}catch {continue;}
-            claude ? consumeClaude(this,state,record) : this.consume(state,record);
+            if (family === 'claude') consumeClaude(this, state, record);
+            else if (family === 'pi') consumePi(this, state, record);
+            else this.consume(state, record);
           }
           state.tail = Buffer.from(pending.subarray(begin));
           state.offset = position;
@@ -150,7 +154,7 @@ export class ActivityStore {
       (!turn.endedAt && (turn.status !== 'running' || turn.timingIncomplete))).length;
     const reset = epoch !== state.epoch || after > state.cursor || (state.events.length && after < state.events[0].sequence-1);
     const current = state.current;
-    const response = {agent:claude ? 'claude' : 'codex', session:id, epoch:state.epoch, cursor:state.cursor, reset:Boolean(reset),
+    const response = {agent:family, session:id, epoch:state.epoch, cursor:state.cursor, reset:Boolean(reset),
       completedSeconds, incompleteTurns,
       current:current ? this.publicTurn(current) : null,
       turns:state.turns.slice(-30).map(x=>this.publicTurn(x)),
@@ -268,5 +272,69 @@ export function consumeClaude(store, state, record) {
   if (message.stop_reason === 'end_turn') {
     turn.status = 'completed'; turn.endedAt = time; turn.timingIncomplete = false; turn.active.clear();
     store.emit(state, turn, record, 'completed');
+  }
+}
+
+// Pi session files: a real user message opens a turn. toolCall / toolResult pair by id.
+// stop ends the turn; error ends it as failed. A later assistant in the same turn is a retry
+// and reopens that failed turn. A new user message marks a still-running turn unknown.
+const piNames = {bash:'command', read:'read', edit:'edit', write:'edit'};
+function piAction(call) {
+  let args = call.arguments ?? {};
+  if (typeof args === 'string') { try { args = JSON.parse(args); } catch { args = {}; } }
+  const category = piNames[call.name] ?? 'tool';
+  let detail = null;
+  if (category === 'command') detail = args.command ? commandSummary(String(args.command)) : null;
+  else if (category === 'read' || category === 'edit') detail = args.path ? base(String(args.path)) : null;
+  else if (args.path ?? args.query ?? args.pattern) detail = String(args.path ?? args.query ?? args.pattern);
+  return {category, name:call.name, detail, described:false};
+}
+export function consumePi(store, state, record) {
+  if (record.type !== 'message') return;
+  const time = record.timestamp, message = record.message;
+  if (!time || !message) return;
+  const blocks = Array.isArray(message.content) ? message.content : [];
+  if (message.role === 'toolResult') {
+    const turn = state.current;
+    if (!turn || turn.status !== 'running') return;
+    const callID = message.toolCallId;
+    const details = callID ? turn.active.get(callID) : null;
+    if (callID) turn.active.delete(callID);
+    store.emit(state, turn, record, 'tool_returned', {callID, ...details});
+    return;
+  }
+  if (message.role === 'user') {
+    if (!blocks.some(block => block.type === 'text' && String(block.text ?? '').trim())) return;
+    if (state.current?.status === 'running') {
+      state.current.status = 'unknown'; state.current.active.clear();
+    }
+    const id = record.id;
+    const next = {id, status:'running', startedAt:time, endedAt:null, active:new Map(), lastEvent:null, timingIncomplete:false};
+    state.turns.push(next); state.current = next;
+    store.emit(state, next, record, 'started');
+    return;
+  }
+  if (message.role !== 'assistant') return;
+  const turn = state.current;
+  if (!turn) return;
+  if (turn.status === 'failed') {
+    turn.status = 'running'; turn.endedAt = null; turn.timingIncomplete = false;
+  }
+  if (turn.status !== 'running') return;
+  for (const block of blocks) {
+    if (block.type === 'toolCall' && block.id) {
+      const details = {callID:block.id, ...piAction(block)};
+      store.emit(state, turn, record, 'tool_started', details);
+      turn.active.set(block.id, {...details, startedAt:time});
+    } else if (block.type === 'text' && String(block.text ?? '').trim()) {
+      store.emit(state, turn, record, 'reply_recorded', {channel:null});
+    }
+  }
+  if (message.stopReason === 'stop') {
+    turn.status = 'completed'; turn.endedAt = time; turn.timingIncomplete = false; turn.active.clear();
+    store.emit(state, turn, record, 'completed');
+  } else if (message.stopReason === 'error') {
+    turn.status = 'failed'; turn.endedAt = time; turn.timingIncomplete = false; turn.active.clear();
+    store.emit(state, turn, record, 'failed');
   }
 }

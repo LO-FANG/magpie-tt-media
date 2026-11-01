@@ -78,8 +78,8 @@ function codexParts(payload) {
   }
 }
 export class MediaStore {
-  constructor(home = process.env.CODEX_HOME || join(homedir(), '.codex'), claudeHome = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')) {
-    this.home = resolve(home); this.claudeHome = resolve(claudeHome); this.cache = new Map(); this.media = new Map();
+  constructor(home = process.env.CODEX_HOME || join(homedir(), '.codex'), claudeHome = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), piHome = process.env.PI_AGENT_DIR || join(homedir(), '.pi', 'agent')) {
+    this.home = resolve(home); this.claudeHome = resolve(claudeHome); this.piHome = resolve(piHome); this.cache = new Map(); this.media = new Map();
     this.activity = new ActivityStore(this);
   }
   async find(id) {
@@ -103,6 +103,13 @@ export class MediaStore {
       try { if ((await stat(file)).isFile()) return file; } catch (e) { if (e.code !== 'ENOENT') throw e; }
     }
     throw Object.assign(new Error('Session not found in this Claude home'), {status:404});
+  }
+  async findPi(id) {
+    if (!uuid.test(id)) throw Object.assign(new Error('Expected a Pi session id'), {status:400});
+    for await (const file of files(join(this.piHome, 'sessions'))) {
+      if (basename(file) === `${id}.jsonl` || basename(file).endsWith(`_${id}.jsonl`)) return file;
+    }
+    throw Object.assign(new Error('Session not found in this Pi home'), {status:404});
   }
   // Claude Code (also run from Claude Desktop's Code tab) keeps uploaded and
   // pasted images as base64 blocks in its own session file; Magpie's
@@ -336,7 +343,7 @@ export async function handle(store,req,res) {
   try {
     const url = new URL(req.url,'http://localhost');
     if (!['GET','HEAD'].includes(req.method)) { res.setHeader('Allow','GET, HEAD'); return json(res,405,{error:'Read-only service'}); }
-    if (url.pathname === '/health') return json(res,200,{name:'magpie-tt-media',version:'0.9.0',agents:['codex','claude'],capabilities:['media','activity','transcript']});
+    if (url.pathname === '/health') return json(res,200,{name:'magpie-tt-media',version:'0.9.0',agents:['codex','claude','pi'],capabilities:['media','activity','transcript']});
     if (url.pathname === '/kilo') return json(res,200,await kiloPass());
     if (url.pathname === '/activity') {
       const result = await store.activity.snapshot(url.searchParams.get('id') ?? '', Number(url.searchParams.get('after') ?? 0), url.searchParams.get('epoch') ?? '', url.searchParams.get('agent') ?? 'codex');

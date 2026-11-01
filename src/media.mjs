@@ -325,6 +325,78 @@ async function kiloPass() {
   body.balance = (await balance.json()).balance;
   return body;
 }
+// TokenDance reads Cursor usage. The access token, email and ids stay out.
+async function cursorCall(url, options) {
+  let res;
+  try { res = await fetch(url, options); }
+  catch { throw Object.assign(new Error('Cursor request failed'), {status:502}); }
+  if (!res.ok) throw Object.assign(new Error(`Cursor request failed (${res.status})`), {status:502});
+  return res.json();
+}
+async function cursorUsage() {
+  let access;
+  try { access = JSON.parse(await readFile(join(homedir(),'.config','magpie','plugin-auth.json'),'utf8')).cursor?.access; }
+  catch (e) { if (e.code !== 'ENOENT') throw e; }
+  if (!access) throw Object.assign(new Error('Cursor is not signed in'), {status:404});
+  let session;
+  try { session = JSON.parse(Buffer.from(access.split('.')[1],'base64url')).sub.split('|').pop(); }
+  catch { throw Object.assign(new Error('Cursor is not signed in'), {status:404}); }
+  const headers = {Authorization:`Bearer ${access}`,'Content-Type':'application/json','Connect-Protocol-Version':'1'};
+  const post = (path, body) => cursorCall(`https://api2.cursor.sh${path}`, {method:'POST', headers, body:JSON.stringify(body)});
+  const [planInfo, period, summary] = await Promise.all([
+    post('/aiserver.v1.DashboardService/GetPlanInfo', {}),
+    post('/aiserver.v1.DashboardService/GetCurrentPeriodUsage', {}),
+    cursorCall('https://cursor.com/api/usage-summary', {headers:{Origin:'https://cursor.com', Cookie:`WorkosCursorSessionToken=${session}%3A%3A${access}`}}),
+  ]);
+  const events = [];
+  let total = 0;
+  for (let page = 1; ; page++) {
+    const data = await post('/aiserver.v1.DashboardService/GetFilteredUsageEvents', {
+      teamId:0, startDate:String(period.billingCycleStart), endDate:String(period.billingCycleEnd), page, pageSize:50,
+    });
+    total = Number(data.totalUsageEventsCount) || 0;
+    const batch = data.usageEventsDisplay ?? [];
+    events.push(...batch);
+    if (!batch.length || events.length >= total) break;
+  }
+  const byModel = new Map();
+  for (const event of events) {
+    const usage = event.tokenUsage ?? {};
+    const row = byModel.get(event.model) ?? {model:event.model, count:0, input:0, output:0, cacheRead:0, cents:0, chargedCents:0};
+    row.count += 1;
+    row.input += Number(usage.inputTokens) || 0;
+    row.output += Number(usage.outputTokens) || 0;
+    row.cacheRead += Number(usage.cacheReadTokens) || 0;
+    row.cents += Number(usage.totalCents) || 0;
+    row.chargedCents += Number(event.chargedCents) || 0;
+    byModel.set(event.model, row);
+  }
+  const plan = summary.individualUsage.plan, onDemand = summary.individualUsage.onDemand;
+  return {
+    plan:{name:planInfo.planName, membership:summary.membershipType, period:planInfo.includedUsagePeriod, resetsAt:Number(planInfo.includedUsageResetsAt)},
+    week:{
+      start:Number(period.billingCycleStart), end:Number(period.billingCycleEnd),
+      autoPercent:Number(period.planUsage.autoPercentUsed) || 0, apiPercent:Number(period.planUsage.apiPercentUsed) || 0, totalPercent:Number(period.planUsage.totalPercentUsed) || 0,
+      message:period.displayMessage ?? '',
+    },
+    month:{
+      start:summary.billingCycleStart, end:summary.billingCycleEnd,
+      used:Number(plan.used) || 0, limit:Number(plan.limit) || 0, remaining:Number(plan.remaining) || 0,
+      onDemand:{enabled:!!onDemand.enabled, used:Number(onDemand.used) || 0, limit:onDemand.limit == null ? null : Number(onDemand.limit)},
+    },
+    models:[...byModel.values()].sort((a, b) => b.cents - a.cents),
+    events:events.map(event => {
+      const usage = event.tokenUsage ?? {};
+      return {
+        ts:Number(event.timestamp), model:event.model,
+        kind:String(event.kind ?? '').replace(/^USAGE_EVENT_KIND_/, '').toLowerCase(),
+        input:Number(usage.inputTokens) || 0, output:Number(usage.outputTokens) || 0, cacheRead:Number(usage.cacheReadTokens) || 0,
+        cents:Number(usage.totalCents) || 0, chargedCents:Number(event.chargedCents) || 0, headless:!!event.isHeadless,
+      };
+    }).sort((a, b) => b.ts - a.ts).slice(0, 50),
+    totalEvents:total, updatedAt:Date.now(),
+  };
+}
 export async function handle(store,req,res) {
   // Magpie frames use an opaque sandbox origin, including after navigation
   // to the local service. Fetch therefore needs an explicit CORS response.
@@ -338,6 +410,7 @@ export async function handle(store,req,res) {
     if (!['GET','HEAD'].includes(req.method)) { res.setHeader('Allow','GET, HEAD'); return json(res,405,{error:'Read-only service'}); }
     if (url.pathname === '/health') return json(res,200,{name:'magpie-tt-media',version:'0.9.0',agents:['codex','claude'],capabilities:['media','activity','transcript']});
     if (url.pathname === '/kilo') return json(res,200,await kiloPass());
+    if (url.pathname === '/cursor') return json(res,200,await cursorUsage());
     if (url.pathname === '/activity') {
       const result = await store.activity.snapshot(url.searchParams.get('id') ?? '', Number(url.searchParams.get('after') ?? 0), url.searchParams.get('epoch') ?? '', url.searchParams.get('agent') ?? 'codex');
       return json(res,200,result);

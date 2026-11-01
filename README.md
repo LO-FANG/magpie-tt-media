@@ -108,3 +108,14 @@ magpie plugin add "$HOME/Desktop/magpie-tt-media"
 - `GET https://api.kilo.ai/api/profile/balance`，返回 `{"balance": number}`。
 
 成功时返回 `tier`、`cadence`、`status`、`cancelAtPeriodEnd`、`startedAt`、`nextBillingAt`、`refillAt`、`currentPeriodBaseCreditsUsd`、`currentPeriodUsageUsd`、`currentPeriodBonusCreditsUsd`、`isBonusUnlocked`、`nextBonusCreditsUsd`、`currentStreakMonths`，以及 `balance`。不返回 stripe id、subscription id，或其他任何 id 与 key。没有配置 kilo，或上游请求失败时，返回带 `error` 字段的 JSON。
+
+## Cursor 用量
+
+`GET /cursor` 给 TokenDance 读取 Cursor 用量明细。每次请求读取 `~/.config/magpie/plugin-auth.json` 的 `cursor.access`（JWT）。令牌刷新由 Magpie 自己的插件负责，此路由不刷新，也不返回或记录 token、邮箱和 id。
+
+- `POST https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo`，取 `planName`、`includedUsagePeriod`、`includedUsageResetsAt`。
+- `POST https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage`，取本周期起止、`planUsage` 的 auto/api/total 百分比和 `displayMessage`。
+- `POST https://api2.cursor.sh/aiserver.v1.DashboardService/GetFilteredUsageEvents`，从该周期 `billingCycleStart` 起按每页 50 条翻到 `totalUsageEventsCount`。插件按模型汇总全部事件（`cents` 降序），`events` 只留最近 50 条；`kind` 去掉 `USAGE_EVENT_KIND_` 前缀并转小写。
+- `GET https://cursor.com/api/usage-summary`，取账单周期、`membershipType`、`individualUsage.plan` 与 `onDemand`。
+
+成功时返回 `plan`、`week`、`month`、`models`、`events`、`totalEvents`、`updatedAt`。未登录 Cursor 返回 404，上游失败返回 502，不重试。

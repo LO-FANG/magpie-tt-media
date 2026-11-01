@@ -1,0 +1,11 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TT 会话附件</title><style>body{font:16px system-ui;max-width:880px;margin:32px auto;padding:0 20px;color:#27243c;background:#faf9fc}input,button{font:inherit;padding:10px;border:1px solid #cbc6da;border-radius:8px}input{width:min(90%,430px)}button{cursor:pointer}article{margin:24px 0;padding:16px;background:white;border-radius:12px}img,video{display:block;max-width:100%;max-height:560px;margin:12px 0}p{overflow-wrap:anywhere;color:#625c74}</style><h1>TT 会话附件</h1><p>输入 Codex 会话 UUID，查看原始记录中的图片和关联的本地视频。</p><form><input aria-label="Codex 会话 UUID" placeholder="Codex 会话 UUID" required><button>读取附件</button></form><p role="status" id="status"></p><main></main><script type="module">
+const form=document.querySelector('form'), status=document.querySelector('#status'), main=document.querySelector('main');
+form.onsubmit=async event=>{
+ event.preventDefault();main.replaceChildren();status.textContent='正在读取…';
+ try{
+ const response=await fetch('session?'+new URLSearchParams({id:form.querySelector('input').value.trim()}));const result=await response.json();if(!response.ok)throw Error(result.error);
+ status.textContent=`找到 ${result.attachments.length} 个附件`;
+ for(const item of result.attachments){const row=document.createElement('article'),label=document.createElement('p'),media=document.createElement(item.kind==='video'?'video':'img');label.textContent=`${item.role} · 第 ${item.line} 行 · ${item.name}`;media.src=item.url;if(item.kind==='video'){media.controls=true;media.preload='metadata';}else{media.alt=item.name;media.loading='lazy';}const link=document.createElement('a');link.href=item.url;link.textContent='打开原文件';link.target='_blank';row.append(label,media,link);main.append(row);}
+ }catch(error){status.textContent=error.message;}
+};
+</script></html>

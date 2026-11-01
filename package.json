@@ -1,0 +1,31 @@
+{
+  "name": "magpie-tt-media",
+  "version": "0.8.1",
+  "description": "Codex session images and local videos for TokenDance",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "src",
+    "page",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "magpie": {
+    "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIiB3aWR0aD0iNTEyIiBoZWlnaHQ9IjUxMiI+PHJlY3Qgd2lkdGg9IjUxMiIgaGVpZ2h0PSI1MTIiIHJ4PSIxMTIiIGZpbGw9IiNGM0YwRUIiLz48ZyBmaWxsPSIjMjAxRTFGIj48cmVjdCB4PSIxMTIiIHk9IjE0MCIgd2lkdGg9IjEyOCIgaGVpZ2h0PSI0MCIgcng9IjEyIi8+PHJlY3QgeD0iMTU2IiB5PSIxNDAiIHdpZHRoPSI0MCIgaGVpZ2h0PSIxNTAiIHJ4PSIxMiIvPgo8cmVjdCB4PSIyNzIiIHk9IjE0MCIgd2lkdGg9IjEyOCIgaGVpZ2h0PSI0MCIgcng9IjEyIi8+PHJlY3QgeD0iMzE2IiB5PSIxNDAiIHdpZHRoPSI0MCIgaGVpZ2h0PSIxNTAiIHJ4PSIxMiIvPjwvZz4KPHBhdGggZD0iTTE1MCAzNTAgUTI0MCAzOTUgMzMwIDM1MiIgZmlsbD0ibm9uZSIgc3Ryb2tlPSIjMjAxRTFGIiBzdHJva2Utd2lkdGg9IjI2IiBzdHJva2UtbGluZWNhcD0icm91bmQiLz4KPGNpcmNsZSBjeD0iMzc4IiBjeT0iMzc4IiByPSI4NiIgZmlsbD0iI0Y1MjU1RSIgc3Ryb2tlPSIjRjNGMEVCIiBzdHJva2Utd2lkdGg9IjE4Ii8+PHBhdGggZD0iTTM1MiAzMzYgTDQxOCAzNzggTDM1MiA0MjAgWiIgZmlsbD0iI0YzRjBFQiIgc3Ryb2tlPSIjRjNGMEVCIiBzdHJva2Utd2lkdGg9IjEwIiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+PC9zdmc+",
+    "page": {
+      "title": "TT Media",
+      "titles": {
+        "zh": "TT 会话附件"
+      },
+      "file": "page/index.html",
+      "service": {
+        "port": 43821,
+        "option": "port"
+      }
+    }
+  }
+}

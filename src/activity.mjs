@@ -69,6 +69,8 @@ export function commandSummary(command) {
 }
 const oneLine = value => String(value).replace(/\s+/g, ' ').trim();
 const base = path => String(path).split('/').filter(Boolean).pop() ?? String(path);
+// Bump when parsing changes. A missing or different version drops the tt-activity cache and rereads the log.
+const cacheVersion = 1;
 
 function action(payload) {
   const name = payload.name ?? payload.type;
@@ -104,11 +106,13 @@ export class ActivityStore {
     if (!state) {
       try {
         const saved = JSON.parse(await readFile(cacheFile, 'utf8'));
-        state = {...saved, epoch:randomUUID(), tail:Buffer.from(saved.tail, 'base64')};
-        state.turns = saved.turns.map(turn => ({...turn, active:new Map(turn.active)}));
-        state.current = state.turns.find(turn => turn.id === saved.currentID) ?? null;
-        if (state.current?.status === 'running') state.current.timingIncomplete = true;
-        this.sessions.set(key, state);
+        if (saved.version === cacheVersion) {
+          state = {...saved, epoch:randomUUID(), tail:Buffer.from(saved.tail, 'base64')};
+          state.turns = saved.turns.map(turn => ({...turn, active:new Map(turn.active)}));
+          state.current = state.turns.find(turn => turn.id === saved.currentID) ?? null;
+          if (state.current?.status === 'running') state.current.timingIncomplete = true;
+          this.sessions.set(key, state);
+        }
       } catch (error) {
         if (error.code !== 'ENOENT') throw error;
       }
@@ -160,7 +164,7 @@ export class ActivityStore {
     }
     if (changed) {
       await mkdir(cacheDirectory, {recursive:true});
-      const saved = {...state, tail:state.tail.toString('base64'), current:undefined,
+      const saved = {...state, version:cacheVersion, tail:state.tail.toString('base64'), current:undefined,
         currentID:state.current?.id,
         turns:state.turns.map(turn => ({...turn, active:[...turn.active]}))};
       await writeFile(`${cacheFile}.tmp`, JSON.stringify(saved));

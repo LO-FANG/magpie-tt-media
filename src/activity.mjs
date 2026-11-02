@@ -87,7 +87,15 @@ export class ActivityStore {
     const family = agent === 'claude' || agent === 'claude-desktop' ? 'claude'
       : ['pi', 'pi-agent', 'pi-coding-agent', 'pi-cli'].includes(agent) ? 'pi' : 'codex';
     const key = `${family}:${id}`;
-    const file = this.sessions.get(key)?.file ?? await (family === 'claude' ? this.media.findClaude(id) : family === 'pi' ? this.media.findPi(id) : this.media.find(id)), info = await stat(file);
+    const locate = () => family === 'claude' ? this.media.findClaude(id) : family === 'pi' ? this.media.findPi(id) : this.media.find(id);
+    let file = this.sessions.get(key)?.file ?? await locate(), info;
+    try { info = await stat(file); }
+    catch (error) {
+      if (error.code !== 'ENOENT' || file !== this.sessions.get(key)?.file) throw error;
+      this.sessions.delete(key);
+      file = await locate();
+      info = await stat(file);
+    }
     if (family === 'codex' && file.endsWith('.zst')) throw Object.assign(new Error('Live activity requires an uncompressed Codex rollout'), {status:422});
     let state = this.sessions.get(key);
     const cacheRoot = family === 'claude' ? this.media.claudeHome : family === 'pi' ? this.media.piHome : this.media.home;
@@ -229,10 +237,13 @@ function claudeAction(block) {
   const category = claudeNames[block.name] ?? 'tool';
   const described = typeof input.description === 'string' && input.description.trim() ? oneLine(input.description) : null;
   let detail = null;
-  if (category === 'command') detail = described ?? (input.command ? commandSummary(input.command) : null);
-  else if (category === 'read' || category === 'edit') detail = described ?? ((input.file_path ?? input.notebook_path) ? base(input.file_path ?? input.notebook_path) : null);
+  let fromDescription = Boolean(described);
+  if (category === 'command') {
+    detail = input.command ? commandSummary(input.command) : described;
+    fromDescription = !input.command && Boolean(described);
+  } else if (category === 'read' || category === 'edit') detail = described ?? ((input.file_path ?? input.notebook_path) ? base(input.file_path ?? input.notebook_path) : null);
   else detail = described ?? input.pattern ?? input.query ?? input.url ?? input.path ?? null;
-  return {category, name:block.name, detail:detail === null ? null : String(detail), described:Boolean(described)};
+  return {category, name:block.name, detail:detail === null ? null : String(detail), described:fromDescription};
 }
 export function consumeClaude(store, state, record) {
   const time = record.timestamp, message = record.message;

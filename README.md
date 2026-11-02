@@ -86,7 +86,7 @@ magpie plugin add "$HOME/Desktop/magpie-tt-media"
 
 ## 0.6.0：动作摘要
 
-工具事件的 `detail` 现在是摘要：Claude 的 Bash 优先用入参 `description`，否则提炼命令（跳过 `cd`/`pwd` 等前缀、变量赋值、heredoc，只取第一条命令）；Read/Edit 取文件名。Codex 命令同样提炼。事件新增 `described`，表示 `detail` 来自描述而非原始命令。
+工具事件的 `detail` 现在是摘要：Claude 的 Bash 与 Codex 一样显示提炼后的命令（跳过 `cd`/`pwd` 等前缀、变量赋值、heredoc，只取第一条命令），不再优先用入参 `description`；Read/Edit 仍优先用描述，否则取文件名。事件的 `described` 表示 `detail` 来自描述而非命令，命令会着色。
 
 ## 0.7.0：Claude 会话保留最新内容
 

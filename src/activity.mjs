@@ -70,7 +70,7 @@ export function commandSummary(command) {
 const oneLine = value => String(value).replace(/\s+/g, ' ').trim();
 const base = path => String(path).split('/').filter(Boolean).pop() ?? String(path);
 // Bump when parsing changes. A missing or different version drops the tt-activity cache and rereads the log.
-const cacheVersion = 1;
+const cacheVersion = 2;
 
 function action(payload) {
   const name = payload.name ?? payload.type;
@@ -203,7 +203,8 @@ export class ActivityStore {
   consume(state,record) {
     const p=record.payload ?? {}, time=record.timestamp;
     const window = record.type === 'turn_context' ? p.model_context_window
-      : record.type === 'event_msg' && p.type === 'token_count' ? p.info?.model_context_window : undefined;
+      : record.type === 'event_msg' && p.type === 'token_count' ? p.info?.model_context_window
+      : record.type === 'event_msg' && p.type === 'task_started' ? p.model_context_window : undefined;
     if (typeof window === 'number') state.contextWindow = window;
     if (!state.promptTitle && record.type === 'event_msg' && p.type === 'user_message') {
       const title = promptTitle(p.message);

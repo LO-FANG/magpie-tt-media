@@ -181,6 +181,12 @@ export class MediaStore {
           const window = record.payload?.info?.model_context_window;
           if (record.type === 'event_msg' && record.payload?.type === 'token_count' && typeof window === 'number') contextWindow = window;
         } catch { /* partial line */ }
+      } else if (line.includes('"task_started"') && line.includes('model_context_window')) {
+        try {
+          const record = JSON.parse(line);
+          const window = record.payload?.model_context_window;
+          if (record.type === 'event_msg' && record.payload?.type === 'task_started' && typeof window === 'number') contextWindow = window;
+        } catch { /* partial line */ }
       }
       if (!prompt && line.includes('"response_item"') && line.includes('"role":"user"')) {
         try {

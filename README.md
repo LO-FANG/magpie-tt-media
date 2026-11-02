@@ -96,6 +96,10 @@ magpie plugin add "$HOME/Desktop/magpie-tt-media"
 
 `GET /transcript?agent=codex&id=<会话 UUID>` 与 Claude 版同结构，从 rollout 末尾往前收集 40 万字符。转换规则对齐 Magpie：消息、推理摘要、`function_call`/`custom_tool_call`/`local_shell_call` 及其输出，助手部分带上最近的 `turn_context` 模型，支持 `.jsonl.zst`。
 
+## 0.9.1：取消、回合结束、标题与上下文窗口
+
+Claude 的 `[Request interrupted by user]`、Pi 的 `stopReason: aborted`（或记录上的 `aborted`）把当前回合记为取消。进程被杀掉、文件里没有这些标记时，超过 3 分钟没有新内容也结束该回合。Claude 同一条 assistant 消息会拆成 thinking 和文本多行，每行都带 `end_turn`；回合结束时间取最后一段 assistant 文本，同一 `message.id` 的后续行继续往后拨。Pi 写出 assistant 文本（含流式 `text_delta`）时记 `reply_recorded`，和 Claude、Codex 一样。Codex、Pi 没有现成标题时用第一条用户提问（40 字）；Codex 现成标题来自 `session_index.jsonl` 的 `thread_name`。`/transcript` 的 Codex 结果带 `contextWindow`，取 `turn_context` 或 `token_count` 的 `model_context_window`。Claude、Pi 会话里如果已经写了窗口大小，同样放进 `contextWindow`。
+
 ## 0.9.0：part 稳定标识
 
 `/transcript` 的每个 part 带 `seq`：该内容在会话文件里的行号乘 1000，加它在这一行内的序号。窗口起点随会话增长向后移动时，同一内容的 `seq` 不变，调用方据此识别内容。

@@ -1,4 +1,4 @@
-import { ActivityStore } from './activity.mjs';
+import { ActivityStore, promptTitle, codexThreadName } from './activity.mjs';
 import { readdir, readFile, stat, realpath } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import { homedir } from 'node:os';
@@ -164,11 +164,36 @@ export class MediaStore {
       : await readFile(file,'utf8');
     const lines = text.split('\n');
     const models = new Array(lines.length);
-    let model = '';
+    let model = '', contextWindow = 0, prompt = '';
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       if (line.includes('"turn_context"') && !line.includes('"response_item"')) {
-        try { const record = JSON.parse(line); if (record.type === 'turn_context') model = record.payload?.model ?? ''; } catch { /* partial line */ }
+        try {
+          const record = JSON.parse(line);
+          if (record.type === 'turn_context') {
+            model = record.payload?.model ?? '';
+            if (typeof record.payload?.model_context_window === 'number') contextWindow = record.payload.model_context_window;
+          }
+        } catch { /* partial line */ }
+      } else if (line.includes('"token_count"') && line.includes('model_context_window')) {
+        try {
+          const record = JSON.parse(line);
+          const window = record.payload?.info?.model_context_window;
+          if (record.type === 'event_msg' && record.payload?.type === 'token_count' && typeof window === 'number') contextWindow = window;
+        } catch { /* partial line */ }
+      }
+      if (!prompt && line.includes('"response_item"') && line.includes('"role":"user"')) {
+        try {
+          const record = JSON.parse(line);
+          const content = record.payload?.content;
+          if (record.type === 'response_item' && record.payload?.type === 'message' && record.payload?.role === 'user') {
+            const parts = typeof content === 'string' ? [content] : Array.isArray(content) ? content.map(part => part?.text ?? '') : [];
+            for (const part of parts) {
+              const title = promptTitle(part);
+              if (title) { prompt = title; break; }
+            }
+          }
+        } catch { /* partial line */ }
       }
       models[i] = model;
     }
@@ -188,7 +213,9 @@ export class MediaStore {
       size += chars;
       collected.push(...kept.reverse());
     }
-    const result = {parts:collected.reverse(), cut, source:'plugin'};
+    const named = await codexThreadName(this.home, id);
+    const result = {parts:collected.reverse(), cut, source:'plugin', title: named || prompt};
+    if (contextWindow) result.contextWindow = contextWindow;
     this.cache.set(key,{revision,result});
     while (this.cache.size > 8) this.cache.delete(this.cache.keys().next().value);
     return result;
@@ -200,6 +227,31 @@ export class MediaStore {
     const key = `claude-transcript:${id}`, previous = this.cache.get(key);
     if (previous?.revision === revision) return previous.result;
     const lines = (await readFile(file,'utf8')).split('\n');
+    let custom = '', named = '', prompt = '', contextWindow = 0;
+    for (const line of lines) {
+      const titled = line.includes('"custom-title"') || line.includes('"ai-title"') || line.includes('"summary"');
+      const windowed = line.includes('contextWindow') || line.includes('model_context_window') || line.includes('"modelUsage"');
+      if (!titled && !windowed && (prompt || !line.includes('"type":"user"'))) continue;
+      let record;
+      try { record = JSON.parse(line); } catch { continue; }
+      if (record.type === 'custom-title' && record.customTitle) custom = String(record.customTitle).replace(/\s+/g, ' ').trim();
+      else if (record.type === 'ai-title' && record.aiTitle) named = String(record.aiTitle).replace(/\s+/g, ' ').trim();
+      else if (record.type === 'summary' && record.summary && !named) named = String(record.summary).replace(/\s+/g, ' ').trim();
+      const window = record.contextWindow ?? record.model_context_window ?? record.message?.usage?.contextWindow ?? record.message?.usage?.model_context_window;
+      if (typeof window === 'number') contextWindow = window;
+      if (record.modelUsage && typeof record.modelUsage === 'object') {
+        for (const item of Object.values(record.modelUsage)) {
+          if (typeof item?.contextWindow === 'number') contextWindow = item.contextWindow;
+        }
+      }
+      if (!prompt && record.type === 'user' && !record.isMeta && !record.isSidechain) {
+        const content = record.message?.content;
+        if (Array.isArray(content) && content.some(part => part.type === 'tool_result')) continue;
+        const text = typeof content === 'string' ? content : Array.isArray(content) ? content.filter(part => part.type === 'text').map(part => part.text).join(' ') : '';
+        const title = promptTitle(text);
+        if (title) prompt = title;
+      }
+    }
     const collected = [];
     let size = 0, cut = false;
     for (let i = lines.length - 1; i >= 0 && !cut; i--) {
@@ -220,7 +272,8 @@ export class MediaStore {
       size += chars;
       collected.push(...kept.reverse());
     }
-    const result = {parts:collected.reverse(), cut, source:'plugin'};
+    const result = {parts:collected.reverse(), cut, source:'plugin', title: custom || named || prompt};
+    if (contextWindow) result.contextWindow = contextWindow;
     this.cache.set(key,{revision,result});
     while (this.cache.size > 8) this.cache.delete(this.cache.keys().next().value);
     return result;

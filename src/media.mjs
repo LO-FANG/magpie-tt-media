@@ -1,4 +1,4 @@
-import { ActivityStore } from './activity.mjs';
+import { ActivityStore, promptTitle, codexThreadName } from './activity.mjs';
 import { readdir, readFile, stat, realpath } from 'node:fs/promises';
 import { createReadStream } from 'node:fs';
 import { homedir } from 'node:os';
@@ -78,8 +78,8 @@ function codexParts(payload) {
   }
 }
 export class MediaStore {
-  constructor(home = process.env.CODEX_HOME || join(homedir(), '.codex'), claudeHome = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')) {
-    this.home = resolve(home); this.claudeHome = resolve(claudeHome); this.cache = new Map(); this.media = new Map();
+  constructor(home = process.env.CODEX_HOME || join(homedir(), '.codex'), claudeHome = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), piHome = process.env.PI_AGENT_DIR || join(homedir(), '.pi', 'agent')) {
+    this.home = resolve(home); this.claudeHome = resolve(claudeHome); this.piHome = resolve(piHome); this.cache = new Map(); this.media = new Map();
     this.activity = new ActivityStore(this);
   }
   async find(id) {
@@ -103,6 +103,13 @@ export class MediaStore {
       try { if ((await stat(file)).isFile()) return file; } catch (e) { if (e.code !== 'ENOENT') throw e; }
     }
     throw Object.assign(new Error('Session not found in this Claude home'), {status:404});
+  }
+  async findPi(id) {
+    if (!uuid.test(id)) throw Object.assign(new Error('Expected a Pi session id'), {status:400});
+    for await (const file of files(join(this.piHome, 'sessions'))) {
+      if (basename(file) === `${id}.jsonl` || basename(file).endsWith(`_${id}.jsonl`)) return file;
+    }
+    throw Object.assign(new Error('Session not found in this Pi home'), {status:404});
   }
   // Claude Code (also run from Claude Desktop's Code tab) keeps uploaded and
   // pasted images as base64 blocks in its own session file; Magpie's
@@ -157,11 +164,42 @@ export class MediaStore {
       : await readFile(file,'utf8');
     const lines = text.split('\n');
     const models = new Array(lines.length);
-    let model = '';
+    let model = '', contextWindow = 0, prompt = '';
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       if (line.includes('"turn_context"') && !line.includes('"response_item"')) {
-        try { const record = JSON.parse(line); if (record.type === 'turn_context') model = record.payload?.model ?? ''; } catch { /* partial line */ }
+        try {
+          const record = JSON.parse(line);
+          if (record.type === 'turn_context') {
+            model = record.payload?.model ?? '';
+            if (typeof record.payload?.model_context_window === 'number') contextWindow = record.payload.model_context_window;
+          }
+        } catch { /* partial line */ }
+      } else if (line.includes('"token_count"') && line.includes('model_context_window')) {
+        try {
+          const record = JSON.parse(line);
+          const window = record.payload?.info?.model_context_window;
+          if (record.type === 'event_msg' && record.payload?.type === 'token_count' && typeof window === 'number') contextWindow = window;
+        } catch { /* partial line */ }
+      } else if (line.includes('"task_started"') && line.includes('model_context_window')) {
+        try {
+          const record = JSON.parse(line);
+          const window = record.payload?.model_context_window;
+          if (record.type === 'event_msg' && record.payload?.type === 'task_started' && typeof window === 'number') contextWindow = window;
+        } catch { /* partial line */ }
+      }
+      if (!prompt && line.includes('"response_item"') && line.includes('"role":"user"')) {
+        try {
+          const record = JSON.parse(line);
+          const content = record.payload?.content;
+          if (record.type === 'response_item' && record.payload?.type === 'message' && record.payload?.role === 'user') {
+            const parts = typeof content === 'string' ? [content] : Array.isArray(content) ? content.map(part => part?.text ?? '') : [];
+            for (const part of parts) {
+              const title = promptTitle(part);
+              if (title) { prompt = title; break; }
+            }
+          }
+        } catch { /* partial line */ }
       }
       models[i] = model;
     }
@@ -181,7 +219,9 @@ export class MediaStore {
       size += chars;
       collected.push(...kept.reverse());
     }
-    const result = {parts:collected.reverse(), cut, source:'plugin'};
+    const named = await codexThreadName(this.home, id);
+    const result = {parts:collected.reverse(), cut, source:'plugin', title: named || prompt};
+    if (contextWindow) result.contextWindow = contextWindow;
     this.cache.set(key,{revision,result});
     while (this.cache.size > 8) this.cache.delete(this.cache.keys().next().value);
     return result;
@@ -193,6 +233,31 @@ export class MediaStore {
     const key = `claude-transcript:${id}`, previous = this.cache.get(key);
     if (previous?.revision === revision) return previous.result;
     const lines = (await readFile(file,'utf8')).split('\n');
+    let custom = '', named = '', prompt = '', contextWindow = 0;
+    for (const line of lines) {
+      const titled = line.includes('"custom-title"') || line.includes('"ai-title"') || line.includes('"summary"');
+      const windowed = line.includes('contextWindow') || line.includes('model_context_window') || line.includes('"modelUsage"');
+      if (!titled && !windowed && (prompt || !line.includes('"type":"user"'))) continue;
+      let record;
+      try { record = JSON.parse(line); } catch { continue; }
+      if (record.type === 'custom-title' && record.customTitle) custom = String(record.customTitle).replace(/\s+/g, ' ').trim();
+      else if (record.type === 'ai-title' && record.aiTitle) named = String(record.aiTitle).replace(/\s+/g, ' ').trim();
+      else if (record.type === 'summary' && record.summary && !named) named = String(record.summary).replace(/\s+/g, ' ').trim();
+      const window = record.contextWindow ?? record.model_context_window ?? record.message?.usage?.contextWindow ?? record.message?.usage?.model_context_window;
+      if (typeof window === 'number') contextWindow = window;
+      if (record.modelUsage && typeof record.modelUsage === 'object') {
+        for (const item of Object.values(record.modelUsage)) {
+          if (typeof item?.contextWindow === 'number') contextWindow = item.contextWindow;
+        }
+      }
+      if (!prompt && record.type === 'user' && !record.isMeta && !record.isSidechain) {
+        const content = record.message?.content;
+        if (Array.isArray(content) && content.some(part => part.type === 'tool_result')) continue;
+        const text = typeof content === 'string' ? content : Array.isArray(content) ? content.filter(part => part.type === 'text').map(part => part.text).join(' ') : '';
+        const title = promptTitle(text);
+        if (title) prompt = title;
+      }
+    }
     const collected = [];
     let size = 0, cut = false;
     for (let i = lines.length - 1; i >= 0 && !cut; i--) {
@@ -213,7 +278,8 @@ export class MediaStore {
       size += chars;
       collected.push(...kept.reverse());
     }
-    const result = {parts:collected.reverse(), cut, source:'plugin'};
+    const result = {parts:collected.reverse(), cut, source:'plugin', title: custom || named || prompt};
+    if (contextWindow) result.contextWindow = contextWindow;
     this.cache.set(key,{revision,result});
     while (this.cache.size > 8) this.cache.delete(this.cache.keys().next().value);
     return result;
@@ -336,7 +402,7 @@ export async function handle(store,req,res) {
   try {
     const url = new URL(req.url,'http://localhost');
     if (!['GET','HEAD'].includes(req.method)) { res.setHeader('Allow','GET, HEAD'); return json(res,405,{error:'Read-only service'}); }
-    if (url.pathname === '/health') return json(res,200,{name:'magpie-tt-media',version:'0.9.0',agents:['codex','claude'],capabilities:['media','activity','transcript']});
+    if (url.pathname === '/health') return json(res,200,{name:'magpie-tt-media',version:'0.9.0',agents:['codex','claude','pi'],capabilities:['media','activity','transcript']});
     if (url.pathname === '/kilo') return json(res,200,await kiloPass());
     if (url.pathname === '/activity') {
       const result = await store.activity.snapshot(url.searchParams.get('id') ?? '', Number(url.searchParams.get('after') ?? 0), url.searchParams.get('epoch') ?? '', url.searchParams.get('agent') ?? 'codex');

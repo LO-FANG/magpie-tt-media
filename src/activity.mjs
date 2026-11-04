@@ -69,6 +69,8 @@ export function commandSummary(command) {
 }
 const oneLine = value => String(value).replace(/\s+/g, ' ').trim();
 const base = path => String(path).split('/').filter(Boolean).pop() ?? String(path);
+// Bump when parsing changes. A missing or different version drops the tt-activity cache and rereads the log.
+const cacheVersion = 2;
 
 function action(payload) {
   const name = payload.name ?? payload.type;
@@ -84,21 +86,33 @@ function action(payload) {
 export class ActivityStore {
   constructor(media) { this.media = media; this.sessions = new Map(); }
   async snapshot(id, after = 0, epoch = '', agent = 'codex') {
-    const claude = agent === 'claude' || agent === 'claude-desktop';
-    const key = `${claude ? 'claude' : 'codex'}:${id}`;
-    const file = this.sessions.get(key)?.file ?? await (claude ? this.media.findClaude(id) : this.media.find(id)), info = await stat(file);
-    if (file.endsWith('.zst')) throw Object.assign(new Error('Live activity requires an uncompressed Codex rollout'), {status:422});
+    const family = agent === 'claude' || agent === 'claude-desktop' ? 'claude'
+      : ['pi', 'pi-agent', 'pi-coding-agent', 'pi-cli'].includes(agent) ? 'pi' : 'codex';
+    const key = `${family}:${id}`;
+    const locate = () => family === 'claude' ? this.media.findClaude(id) : family === 'pi' ? this.media.findPi(id) : this.media.find(id);
+    let file = this.sessions.get(key)?.file ?? await locate(), info;
+    try { info = await stat(file); }
+    catch (error) {
+      if (error.code !== 'ENOENT' || file !== this.sessions.get(key)?.file) throw error;
+      this.sessions.delete(key);
+      file = await locate();
+      info = await stat(file);
+    }
+    if (family === 'codex' && file.endsWith('.zst')) throw Object.assign(new Error('Live activity requires an uncompressed Codex rollout'), {status:422});
     let state = this.sessions.get(key);
-    const cacheDirectory = join(claude ? this.media.claudeHome : this.media.home, 'tt-activity');
+    const cacheRoot = family === 'claude' ? this.media.claudeHome : family === 'pi' ? this.media.piHome : this.media.home;
+    const cacheDirectory = join(cacheRoot, 'tt-activity');
     const cacheFile = join(cacheDirectory, `${id}.json`);
     if (!state) {
       try {
         const saved = JSON.parse(await readFile(cacheFile, 'utf8'));
-        state = {...saved, epoch:randomUUID(), tail:Buffer.from(saved.tail, 'base64')};
-        state.turns = saved.turns.map(turn => ({...turn, active:new Map(turn.active)}));
-        state.current = state.turns.find(turn => turn.id === saved.currentID) ?? null;
-        if (state.current?.status === 'running') state.current.timingIncomplete = true;
-        this.sessions.set(key, state);
+        if (saved.version === cacheVersion) {
+          state = {...saved, epoch:randomUUID(), tail:Buffer.from(saved.tail, 'base64')};
+          state.turns = saved.turns.map(turn => ({...turn, active:new Map(turn.active)}));
+          state.current = state.turns.find(turn => turn.id === saved.currentID) ?? null;
+          if (state.current?.status === 'running') state.current.timingIncomplete = true;
+          this.sessions.set(key, state);
+        }
       } catch (error) {
         if (error.code !== 'ENOENT') throw error;
       }
@@ -127,7 +141,9 @@ export class ActivityStore {
             const line=pending.subarray(begin,end).toString('utf8');begin=end+1;
             if (!line.trim()) continue;
             let record;try {record=JSON.parse(line);}catch {continue;}
-            claude ? consumeClaude(this,state,record) : this.consume(state,record);
+            if (family === 'claude') consumeClaude(this, state, record);
+            else if (family === 'pi') consumePi(this, state, record);
+            else this.consume(state, record);
           }
           state.tail = Buffer.from(pending.subarray(begin));
           state.offset = position;
@@ -136,9 +152,19 @@ export class ActivityStore {
     }
     // A historical start alone cannot establish that a turn is still executing.
     if (rebuilt && state.current?.status === 'running') state.current.timingIncomplete = true;
+    // Claude and Pi write no end record when the process is killed. A long gap ends that turn.
+    if ((family === 'claude' || family === 'pi') && state.current?.status === 'running' && Date.now() - info.mtimeMs >= 3 * 60 * 1000) {
+      const turn = state.current;
+      turn.status = 'cancelled';
+      turn.endedAt = new Date(info.mtimeMs).toISOString();
+      turn.timingIncomplete = false;
+      turn.active.clear();
+      this.emit(state, turn, {timestamp: turn.endedAt}, 'cancelled');
+      changed = true;
+    }
     if (changed) {
       await mkdir(cacheDirectory, {recursive:true});
-      const saved = {...state, tail:state.tail.toString('base64'), current:undefined,
+      const saved = {...state, version:cacheVersion, tail:state.tail.toString('base64'), current:undefined,
         currentID:state.current?.id,
         turns:state.turns.map(turn => ({...turn, active:[...turn.active]}))};
       await writeFile(`${cacheFile}.tmp`, JSON.stringify(saved));
@@ -150,8 +176,14 @@ export class ActivityStore {
       (!turn.endedAt && (turn.status !== 'running' || turn.timingIncomplete))).length;
     const reset = epoch !== state.epoch || after > state.cursor || (state.events.length && after < state.events[0].sequence-1);
     const current = state.current;
-    const response = {agent:claude ? 'claude' : 'codex', session:id, epoch:state.epoch, cursor:state.cursor, reset:Boolean(reset),
-      completedSeconds, incompleteTurns,
+    let title = state.customTitle || state.namedTitle || state.promptTitle || '';
+    if (family === 'codex') {
+      const named = await codexThreadName(this.media.home, id);
+      if (named) title = named;
+    }
+    const response = {agent:family, session:id, epoch:state.epoch, cursor:state.cursor, reset:Boolean(reset),
+      completedSeconds, incompleteTurns, title,
+      ...(state.contextWindow ? {contextWindow: state.contextWindow} : {}),
       current:current ? this.publicTurn(current) : null,
       turns:state.turns.slice(-30).map(x=>this.publicTurn(x)),
       events:state.events.filter(x=>reset || x.sequence>after)};
@@ -159,7 +191,7 @@ export class ActivityStore {
     return response;
   }
   publicTurn(turn) {
-    const {active,...result}=turn;
+    const {active, messageID, ...result}=turn;
     return {...result, activeTools:[...active.values()]};
   }
   emit(state, turn, record, kind, details={}) {
@@ -170,6 +202,22 @@ export class ActivityStore {
   }
   consume(state,record) {
     const p=record.payload ?? {}, time=record.timestamp;
+    const window = record.type === 'turn_context' ? p.model_context_window
+      : record.type === 'event_msg' && p.type === 'token_count' ? p.info?.model_context_window
+      : record.type === 'event_msg' && p.type === 'task_started' ? p.model_context_window : undefined;
+    if (typeof window === 'number') state.contextWindow = window;
+    if (!state.promptTitle && record.type === 'event_msg' && p.type === 'user_message') {
+      const title = promptTitle(p.message);
+      if (title) state.promptTitle = title;
+    }
+    if (!state.promptTitle && record.type === 'response_item' && p.type === 'message' && p.role === 'user') {
+      const content = p.content;
+      const parts = typeof content === 'string' ? [content] : Array.isArray(content) ? content.map(part => part?.text ?? '') : [];
+      for (const part of parts) {
+        const title = promptTitle(part);
+        if (title) { state.promptTitle = title; break; }
+      }
+    }
     if (record.type==='event_msg' && p.type==='task_started' && p.turn_id) {
       if (state.current?.status==='running' && state.current.id!==p.turn_id) {
         state.current.status='unknown';state.current.active.clear();
@@ -213,8 +261,32 @@ export class ActivityStore {
   }
 }
 
+// The first real question, when a session has no title of its own. Codex and Pi
+// sessions often have none; Claude's own title still wins when it is present.
+export function promptTitle(text) {
+  const line = oneLine(text ?? '');
+  if (!line || line.startsWith('<') || line.startsWith('# AGENTS.md') || line.startsWith('[Request interrupted') || line.startsWith('Caveat:')) return '';
+  return [...line].slice(0, 40).join('');
+}
+export async function codexThreadName(home, id) {
+  let text;
+  try { text = await readFile(join(home, 'session_index.jsonl'), 'utf8'); }
+  catch (error) { if (error.code === 'ENOENT') return ''; throw error; }
+  let name = '';
+  for (const line of text.split('\n')) {
+    if (!line.includes(id)) continue;
+    try {
+      const entry = JSON.parse(line);
+      if (entry.id === id && entry.thread_name) name = oneLine(entry.thread_name);
+    } catch { /* partial line */ }
+  }
+  return name;
+}
+
 // Claude Code (also Claude Desktop's Code tab) session files: a turn starts at a
-// real user prompt and ends at an assistant message with stop_reason end_turn.
+// real user prompt and ends at the last assistant text of that message whose
+// stop_reason is end_turn. A thinking block is written first and carries the
+// same end_turn; it does not end the turn.
 const claudeNames = {
   Bash:'command', PowerShell:'command', Read:'read', NotebookRead:'read',
   Edit:'edit', Write:'edit', MultiEdit:'edit', NotebookEdit:'edit',
@@ -225,12 +297,45 @@ function claudeAction(block) {
   const category = claudeNames[block.name] ?? 'tool';
   const described = typeof input.description === 'string' && input.description.trim() ? oneLine(input.description) : null;
   let detail = null;
-  if (category === 'command') detail = described ?? (input.command ? commandSummary(input.command) : null);
-  else if (category === 'read' || category === 'edit') detail = described ?? ((input.file_path ?? input.notebook_path) ? base(input.file_path ?? input.notebook_path) : null);
+  let fromDescription = Boolean(described);
+  if (category === 'command') {
+    detail = input.command ? commandSummary(input.command) : described;
+    fromDescription = !input.command && Boolean(described);
+  } else if (category === 'read' || category === 'edit') detail = described ?? ((input.file_path ?? input.notebook_path) ? base(input.file_path ?? input.notebook_path) : null);
   else detail = described ?? input.pattern ?? input.query ?? input.url ?? input.path ?? null;
-  return {category, name:block.name, detail:detail === null ? null : String(detail), described:Boolean(described)};
+  return {category, name:block.name, detail:detail === null ? null : String(detail), described:fromDescription};
+}
+function claudeHasText(blocks) {
+  return blocks.some(block => block.type === 'text' && String(block.text ?? '').trim());
+}
+function claudeActivity(store, state, turn, record, blocks) {
+  for (const block of blocks) {
+    if (block.type === 'tool_use' && block.id) {
+      const details = {callID:block.id, ...claudeAction(block)};
+      store.emit(state, turn, record, 'tool_started', details);
+      turn.active.set(block.id, {...details, startedAt:record.timestamp});
+    } else if (block.type === 'text' && String(block.text ?? '').trim()) {
+      store.emit(state, turn, record, 'reply_recorded', {channel:null});
+    }
+  }
+}
+function claudeWindow(record) {
+  const usage = record.message?.usage;
+  const direct = record.contextWindow ?? record.model_context_window ?? usage?.contextWindow ?? usage?.model_context_window;
+  if (typeof direct === 'number') return direct;
+  const models = record.modelUsage;
+  if (!models || typeof models !== 'object') return 0;
+  for (const item of Object.values(models)) {
+    if (typeof item?.contextWindow === 'number') return item.contextWindow;
+  }
+  return 0;
 }
 export function consumeClaude(store, state, record) {
+  if (record.type === 'custom-title' && record.customTitle) state.customTitle = oneLine(record.customTitle);
+  else if (record.type === 'ai-title' && record.aiTitle) state.namedTitle = oneLine(record.aiTitle);
+  else if (record.type === 'summary' && record.summary && !state.namedTitle) state.namedTitle = oneLine(record.summary);
+  const window = claudeWindow(record);
+  if (window) state.contextWindow = window;
   const time = record.timestamp, message = record.message;
   if (!time || !message || !['user','assistant'].includes(record.type) || record.isSidechain) return;
   const blocks = Array.isArray(message.content) ? message.content : [{type:'text', text:String(message.content ?? '')}];
@@ -243,10 +348,23 @@ export function consumeClaude(store, state, record) {
       turn.active.delete(result.tool_use_id);
       store.emit(state, turn, record, 'tool_returned', {callID:result.tool_use_id, ...details});
     }
+    const text = blocks.filter(b => b.type === 'text').map(b => b.text).join(' ');
+    // Ctrl-C / Esc writes this instead of a prompt. It closes the open turn.
+    if (text.trim().startsWith('[Request interrupted')) {
+      if (turn?.status === 'running') {
+        turn.status = 'cancelled'; turn.endedAt = time; turn.timingIncomplete = false; turn.active.clear();
+        store.emit(state, turn, record, 'cancelled');
+      }
+      return;
+    }
     if (results.length || record.isMeta || !blocks.some(b => b.type === 'text' || b.type === 'image')) return;
     // Only a real prompt opens a turn; a new one closes a turn that never ended.
     if (state.current?.status === 'running') {
       state.current.status = 'unknown'; state.current.active.clear();
+    }
+    if (!state.promptTitle) {
+      const title = promptTitle(text);
+      if (title) state.promptTitle = title;
     }
     const id = record.promptId ?? record.uuid;
     const next = {id, status:'running', startedAt:time, endedAt:null, active:new Map(), lastEvent:null, timingIncomplete:false};
@@ -255,18 +373,117 @@ export function consumeClaude(store, state, record) {
     return;
   }
   const turn = state.current;
-  if (!turn || turn.status !== 'running') return;
+  if (!turn) return;
+  // One assistant message is split across lines that share message.id. The
+  // thinking line's end_turn is not the end; later lines of that message move it.
+  if (turn.status === 'completed' && message.id && turn.messageID === message.id) {
+    claudeActivity(store, state, turn, record, blocks);
+    turn.endedAt = time;
+    turn.active.clear();
+    return;
+  }
+  if (turn.status !== 'running') return;
+  claudeActivity(store, state, turn, record, blocks);
+  if (message.id) turn.messageID = message.id;
+  if (message.stop_reason === 'end_turn' && claudeHasText(blocks)) {
+    turn.status = 'completed'; turn.endedAt = time; turn.timingIncomplete = false; turn.active.clear();
+    store.emit(state, turn, record, 'completed');
+  }
+}
+
+// Pi session files: a real user message opens a turn. toolCall / toolResult pair by id.
+// stop ends the turn; aborted (Esc) cancels it; error ends it as failed. Assistant text,
+// including a streaming text_delta, is reply_recorded — the same output signal Claude and
+// Codex emit. A later assistant in the same turn is a retry and reopens that failed turn.
+// A new user message marks a still-running turn unknown.
+const piNames = {bash:'command', read:'read', edit:'edit', write:'edit'};
+function piAction(call) {
+  let args = call.arguments ?? {};
+  if (typeof args === 'string') { try { args = JSON.parse(args); } catch { args = {}; } }
+  const category = piNames[call.name] ?? 'tool';
+  let detail = null;
+  if (category === 'command') detail = args.command ? commandSummary(String(args.command)) : null;
+  else if (category === 'read' || category === 'edit') detail = args.path ? base(String(args.path)) : null;
+  else if (args.path ?? args.query ?? args.pattern) detail = String(args.path ?? args.query ?? args.pattern);
+  return {category, name:call.name, detail, described:false};
+}
+function piBlocks(message) {
+  if (Array.isArray(message.content)) return message.content;
+  if (typeof message.content === 'string') return [{type:'text', text:message.content}];
+  return [];
+}
+function cancelTurn(store, state, turn, record, time) {
+  turn.status = 'cancelled'; turn.endedAt = time; turn.timingIncomplete = false; turn.active.clear();
+  store.emit(state, turn, record, 'cancelled');
+}
+export function consumePi(store, state, record) {
+  if (record.type === 'session' && record.title) state.namedTitle = oneLine(record.title);
+  if (record.type === 'session_info' && record.name) state.namedTitle = oneLine(record.name);
+  if ((record.type === 'title' || record.type === 'title_change') && record.title) state.namedTitle = oneLine(record.title);
+  if (typeof record.contextWindow === 'number') state.contextWindow = record.contextWindow;
+  if (typeof record.message?.contextWindow === 'number') state.contextWindow = record.message.contextWindow;
+  if (record.aborted === true && state.current?.status === 'running') {
+    cancelTurn(store, state, state.current, record, record.timestamp);
+    return;
+  }
+  const update = record.assistantMessageEvent;
+  if (record.type === 'message_update' && state.current?.status === 'running' && ['text_delta','text_end','text'].includes(update?.type)) {
+    store.emit(state, state.current, record, 'reply_recorded', {channel:null});
+    return;
+  }
+  if (record.type !== 'message') return;
+  const time = record.timestamp, message = record.message;
+  if (!time || !message) return;
+  const blocks = piBlocks(message);
+  if (message.role === 'toolResult') {
+    const turn = state.current;
+    if (!turn || turn.status !== 'running') return;
+    const callID = message.toolCallId;
+    const details = callID ? turn.active.get(callID) : null;
+    if (callID) turn.active.delete(callID);
+    store.emit(state, turn, record, 'tool_returned', {callID, ...details});
+    return;
+  }
+  if (message.role === 'user') {
+    if (!blocks.some(block => block.type === 'text' && String(block.text ?? '').trim())) return;
+    if (!state.promptTitle && !state.namedTitle) {
+      for (const block of blocks) {
+        const title = block.type === 'text' ? promptTitle(block.text) : '';
+        if (title) { state.promptTitle = title; break; }
+      }
+    }
+    if (state.current?.status === 'running') {
+      state.current.status = 'unknown'; state.current.active.clear();
+    }
+    const id = record.id;
+    const next = {id, status:'running', startedAt:time, endedAt:null, active:new Map(), lastEvent:null, timingIncomplete:false};
+    state.turns.push(next); state.current = next;
+    store.emit(state, next, record, 'started');
+    return;
+  }
+  if (message.role !== 'assistant') return;
+  const turn = state.current;
+  if (!turn) return;
+  if (turn.status === 'failed') {
+    turn.status = 'running'; turn.endedAt = null; turn.timingIncomplete = false;
+  }
+  if (turn.status !== 'running') return;
   for (const block of blocks) {
-    if (block.type === 'tool_use' && block.id) {
-      const details = {callID:block.id, ...claudeAction(block)};
+    if (block.type === 'toolCall' && block.id) {
+      const details = {callID:block.id, ...piAction(block)};
       store.emit(state, turn, record, 'tool_started', details);
       turn.active.set(block.id, {...details, startedAt:time});
-    } else if (block.type === 'text' && block.text?.trim()) {
+    } else if (block.type === 'text' && String(block.text ?? '').trim()) {
       store.emit(state, turn, record, 'reply_recorded', {channel:null});
     }
   }
-  if (message.stop_reason === 'end_turn') {
+  if (message.stopReason === 'stop') {
     turn.status = 'completed'; turn.endedAt = time; turn.timingIncomplete = false; turn.active.clear();
     store.emit(state, turn, record, 'completed');
+  } else if (message.stopReason === 'aborted' || message.aborted === true) {
+    cancelTurn(store, state, turn, record, time);
+  } else if (message.stopReason === 'error') {
+    turn.status = 'failed'; turn.endedAt = time; turn.timingIncomplete = false; turn.active.clear();
+    store.emit(state, turn, record, 'failed');
   }
 }
